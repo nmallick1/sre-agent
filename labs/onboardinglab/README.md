@@ -262,12 +262,14 @@ You need:
 
 #### Fork this repository
 
-In step 6 you connect a repository to the lab creator agent so it can read
-[agent-deploy-runbook.md](agent-deploy-runbook.md) and the Bicep templates. Connect a fork
-you own rather than `microsoft/sre-agent` directly. Code Access grants the agent the
-repositories your GitHub account can reach, and many organisations restrict connecting
-repositories outside the org. A fork also pins the lab at a revision you control, so an
-upstream change cannot move the runbook under you part way through.
+The lab creator agent clones a repository through Code Access and deploys the lab from it,
+reading [agent-deploy-runbook.md](agent-deploy-runbook.md) and the Bicep templates. You
+connect that repository in step 6.
+
+Connect a fork you own rather than `microsoft/sre-agent` directly. Code Access grants the
+agent the repositories your GitHub account can reach, and many organisations restrict
+connecting repositories outside the org. A fork also pins the lab at a revision you control,
+so an upstream change cannot move the runbook under you part way through.
 
 Fork from the GitHub UI at [microsoft/sre-agent](https://github.com/microsoft/sre-agent)
 using **Fork**, or from Cloud Shell if the GitHub CLI is signed in:
@@ -276,13 +278,23 @@ using **Fork**, or from Cloud Shell if the GitHub CLI is signed in:
 gh repo fork microsoft/sre-agent --clone=false
 ```
 
-Then clone your fork and run the bootstrap:
+**You do not clone the fork yourself.** The agent does that. You only need one file.
+
+#### Run the bootstrap
+
+Open [Azure Cloud Shell](https://shell.azure.com) in PowerShell mode, download the script
+from your fork and run it:
 
 ```powershell
-git clone https://github.com/<your-github-account>/sre-agent.git
-Set-Location ./sre-agent/labs/onboardinglab
-./scripts/bootstrap-labcreator.ps1
+$fork = '<your-github-account>'
+Invoke-WebRequest -OutFile bootstrap-labcreator.ps1 `
+  "https://raw.githubusercontent.com/$fork/sre-agent/main/labs/onboardinglab/scripts/bootstrap-labcreator.ps1"
+./bootstrap-labcreator.ps1
 ```
+
+The script is self-contained: it uses only the Azure CLI, needs no repository clone and
+compiles no Bicep. Downloading it from your fork keeps it in step with the runbook the agent
+will follow.
 
 This fork is separate from the GitHub repository used in
 [manual setup](#manual-setup), where the lab agent files issues and any repository you can
@@ -293,7 +305,8 @@ The script:
 1. Registers the `Microsoft.App` resource provider.
 2. Creates `SreAgentLabCreatorRG` and the lab resource group (default
    `SreAgentOnboardingLabRG`, prompted).
-3. Creates the `labcreator-sreagent` agent in High access, Review mode.
+3. Creates Log Analytics, Application Insights, a managed identity, and the
+   `labcreator-sreagent` agent in High access, Review mode.
 4. Adds `*.bicep.azure.com`, `*.azurewebsites.net` and `*.azuresre.ai` to that agent's
    egress allowlist, preserving the existing entries.
 5. Grants the agent's managed identity Owner on the lab resource group.

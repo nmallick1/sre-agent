@@ -1,42 +1,57 @@
 <#
 .SYNOPSIS
-    Bootstraps the Azure SRE Agent Onboarding Lab by creating a lab-creator agent that then
-    deploys the lab for you.
+    Creates the "lab creator" SRE Agent that deploys the Onboarding Lab for you.
 
 .DESCRIPTION
-    Run this once from Azure Cloud Shell (PowerShell). It:
+    Run this in Azure Cloud Shell (PowerShell). It is self-contained: it uses only
+    the Azure CLI, needs no local tooling, and does NOT need a clone of this
+    repository. Every Azure resource is created through az, so there is no Bicep
+    to compile here.
 
-      1. Registers the Microsoft.App resource provider.
-      2. Creates the lab-creator resource group and the lab resource group.
-      3. Creates the `labcreator-sreagent` SRE Agent.
-      4. Adds the egress hosts the agent needs in order to deploy the lab.
-      5. Grants that agent's managed identity Owner on the lab resource group.
-      6. Pauses while you connect your fork of the sre-agent repo as a code repository.
-      7. Starts an agent thread pointing at labs/onboardinglab/agent-deploy-runbook.md.
+    The agent this script creates is the thing that deploys the lab. It clones
+    your fork through Code Access and runs the Bicep templates itself.
 
-    The script is re-entrant. Progress is recorded in a state file, so if Cloud Shell times out
-    or the browser crashes you can simply run it again and it resumes from the first incomplete
-    step. Use -Reset to start over.
+    Steps:
+      0. Preflight: check az, resolve the subscription, resolve the lab RG name.
+      1. Register the Microsoft.App resource provider.
+      2. Create the lab-creator and lab resource groups.
+      3. Create Log Analytics, Application Insights, a managed identity and the agent.
+      4. Append the egress hosts the agent needs to reach while deploying.
+      5. Grant the agent's identity Owner on the lab resource group.
+      6. Pause while you connect your fork as a code repository.
+      7. Start a thread asking the agent to deploy the lab.
 
-    You must run this from a clone of the sre-agent repository: the script deploys
-    sreagent-templates/bicep/agent-core.bicep from the repo.
+    The script is re-entrant. Most steps check Azure itself and skip work that
+    already exists, so a dropped Cloud Shell session is safe: run it again. If the
+    browser closes or the session times out you can simply run it again and it
+    resumes from the first incomplete step. Use -Reset to start over.
+
+.PARAMETER Subscription
+    Subscription to deploy into. Defaults to the current az subscription.
 
 .PARAMETER LabResourceGroup
     Resource group the lab workload is deployed into. Prompted for if not supplied.
 
 .PARAMETER Location
-    Region for the agent and the lab. Must support both Azure SRE Agent and PostgreSQL Flexible
-    Server. Defaults to swedencentral.
+    Region for the agent and the lab. Must support both Azure SRE Agent and, on
+    your subscription, PostgreSQL Flexible Server 16 / Standard_B1ms.
+
+.PARAMETER StateFile
+    Where progress is recorded so the script can resume.
 
 .PARAMETER Reset
-    Discard saved progress and run every step again.
+    Discard saved progress and start from the beginning.
+
+.PARAMETER NewThread
+    Start another deployment thread even if one was started already.
 
 .EXAMPLE
     ./bootstrap-labcreator.ps1
 
 .EXAMPLE
-    ./bootstrap-labcreator.ps1 -LabResourceGroup MyLabRG -Location uksouth
+    ./bootstrap-labcreator.ps1 -LabResourceGroup MyLabRG -Location swedencentral
 #>
+
 [CmdletBinding()]
 param(
     [string] $Subscription,
@@ -68,6 +83,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7 -and $PSVersionTable.PSVersion.Minor -
     $PSNativeCommandArgumentPassing = 'Legacy'
 }
 
+$AgentApiVersion = '2025-05-01-preview'
+
 # Hosts the lab-creator agent must reach to deploy the lab.
 #   *.bicep.azure.com     - download the Bicep compiler for --template-file *.bicep
 #   *.azurewebsites.net   - smoke-test the deployed checkout app
@@ -79,12 +96,6 @@ $RequiredEgressHosts = @(
 )
 
 $RunbookPath = 'labs/onboardinglab/agent-deploy-runbook.md'
-
-# ── Paths ───────────────────────────────────────────────────────────────────
-
-$labRoot = Split-Path $PSScriptRoot -Parent
-$repoRoot = Split-Path (Split-Path $labRoot -Parent) -Parent
-$agentCoreBicep = Join-Path $repoRoot 'sreagent-templates/bicep/agent-core.bicep'
 
 # ── Output helpers ──────────────────────────────────────────────────────────
 
@@ -126,7 +137,7 @@ function Set-StepDone {
     Save-State -State $State
 }
 
-# ── az helper ───────────────────────────────────────────────────────────────
+# ── az helpers ──────────────────────────────────────────────────────────────
 
 function Invoke-Az {
     <#
@@ -155,6 +166,73 @@ function Invoke-Az {
     }
 }
 
+function Invoke-ArmRequest {
+    <#
+        PUT or PATCH an ARM resource through 'az rest'. Used instead of
+        'az resource create' because the agent needs a top-level identity block,
+        and App Insights needs a top-level kind, neither of which that command sets.
+        Going through az rest also avoids depending on any az extension.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Method,
+        [Parameter(Mandatory)][string] $Url,
+        [Parameter(Mandatory)] $Body
+    )
+
+    $file = Join-Path ([System.IO.Path]::GetTempPath()) ("arm-" + [guid]::NewGuid().ToString('n') + '.json')
+    try {
+        $Body | ConvertTo-Json -Depth 20 | Set-Content -Path $file -NoNewline
+        return Invoke-Az @(
+            'rest', '--method', $Method, '--url', $Url,
+            '--headers', 'Content-Type=application/json',
+            '--body', "@$file"
+        ) -AllowEmpty
+    }
+    finally {
+        Remove-Item -Path $file -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-AgentResource {
+    param([Parameter(Mandatory)][string] $ResourceGroup, [Parameter(Mandatory)][string] $Name)
+    try {
+        return Invoke-Az @(
+            'resource', 'show', '-g', $ResourceGroup, '-n', $Name,
+            '--resource-type', 'Microsoft.App/agents', '--api-version', $AgentApiVersion, '-o', 'json'
+        )
+    }
+    catch { return $null }
+}
+
+function Wait-ForAgent {
+    <#
+        Agent create and update are long-running: ARM returns before the resource is
+        ready, so poll until it settles.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $ResourceGroup,
+        [Parameter(Mandatory)][string] $Name,
+        [int] $TimeoutMinutes = 20
+    )
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $state = $null
+    do {
+        Start-Sleep -Seconds 15
+        $agent = Get-AgentResource -ResourceGroup $ResourceGroup -Name $Name
+        $state = if ($agent) { $agent.properties.provisioningState } else { 'NotFound' }
+        Write-Note "  ... $state"
+        if ($state -in @('Failed', 'Canceled')) {
+            throw "Agent provisioning ended in state $state. Check the deployment in the portal."
+        }
+    } while ($state -ne 'Succeeded' -and (Get-Date) -lt $deadline)
+
+    if ($state -ne 'Succeeded') {
+        throw "Agent did not reach Succeeded within $TimeoutMinutes minutes (last state: $state)."
+    }
+    return $agent
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 
 Write-Host 'Azure SRE Agent - Onboarding Lab bootstrap' -ForegroundColor White
@@ -169,9 +247,6 @@ Write-Step 'Preflight'
 
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw 'The Azure CLI (az) was not found. Run this from Azure Cloud Shell (PowerShell).'
-}
-if (-not (Test-Path $agentCoreBicep)) {
-    throw "Could not find $agentCoreBicep. Run this script from a clone of the sre-agent repository."
 }
 
 $account = Invoke-Az @('account', 'show', '-o', 'json')
@@ -197,7 +272,7 @@ Write-Ok "Subscription: $($account.name) ($subId)"
 Write-Ok "Signed in as: $($account.user.name)"
 
 # Resolve the lab resource group name up front. The agent is created with both resource
-# groups in scope, so the name has to be known before the agent is deployed.
+# groups in scope, so the name has to be known before the agent is created.
 if (-not $LabResourceGroup) {
     if ($state.Contains('labResourceGroup')) {
         $LabResourceGroup = $state['labResourceGroup']
@@ -264,22 +339,16 @@ foreach ($rg in @($LabCreatorResourceGroup, $LabResourceGroup)) {
 
 Write-Step 'Step 3 - Create the lab-creator agent'
 
-$agentExists = $null
-try {
-    $agentExists = Invoke-Az @(
-        'resource', 'show', '-g', $LabCreatorResourceGroup, '-n', $LabCreatorAgentName,
-        '--resource-type', 'Microsoft.App/agents', '--api-version', '2025-05-01-preview', '-o', 'json'
-    )
-}
-catch { $agentExists = $null }
+$agent = Get-AgentResource -ResourceGroup $LabCreatorResourceGroup -Name $LabCreatorAgentName
 
-if ($agentExists -and $agentExists.properties.provisioningState -eq 'Succeeded') {
+if ($agent -and $agent.properties.provisioningState -eq 'Succeeded') {
     # Tracked so Step 7 can distinguish "first run" from "state file was lost".
     $agentAlreadyExisted = $true
     Write-Ok "Agent $LabCreatorAgentName already exists."
 }
 else {
     $agentAlreadyExisted = $false
+
     # Deterministic suffix so re-runs address the same Log Analytics / App Insights resources.
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -288,54 +357,132 @@ else {
     }
     finally { $sha.Dispose() }
 
-    $paramsObject = [ordered]@{
-        '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
-        contentVersion = '1.0.0.0'
-        parameters     = [ordered]@{
-            agentName            = @{ value = $LabCreatorAgentName }
-            location             = @{ value = $Location }
-            suffix               = @{ value = $suffix }
-            # High so the agent can deploy the lab; Review so you approve each action.
-            accessLevel          = @{ value = 'High' }
-            actionMode           = @{ value = 'Review' }
-            subscriptionId       = @{ value = $subId }
-            targetResourceGroups = @{ value = @($LabCreatorResourceGroup, $LabResourceGroup) }
-            defaultModelProvider = @{ value = 'MicrosoftFoundry' }
-            tags                 = @{ value = @{ workload = 'onboardinglab-labcreator' } }
+    $rgBase = "https://management.azure.com/subscriptions/$subId/resourceGroups/$LabCreatorResourceGroup/providers"
+
+    # Log Analytics workspace — backs Application Insights.
+    $lawName = "law-$suffix"
+    Write-Note "Creating Log Analytics workspace $lawName..."
+    $law = Invoke-ArmRequest -Method 'put' `
+        -Url "$rgBase/Microsoft.OperationalInsights/workspaces/$lawName`?api-version=2023-09-01" `
+        -Body ([ordered]@{
+            location   = $Location
+            properties = [ordered]@{
+                sku             = @{ name = 'PerGB2018' }
+                retentionInDays = 30
+            }
+        })
+    if (-not $law.id) { throw "Could not create Log Analytics workspace $lawName." }
+    Write-Ok "Workspace $lawName ready."
+
+    # Application Insights — the agent's own telemetry.
+    $aiName = "ai-$suffix"
+    Write-Note "Creating Application Insights $aiName..."
+    $null = Invoke-ArmRequest -Method 'put' `
+        -Url "$rgBase/Microsoft.Insights/components/$aiName`?api-version=2020-02-02" `
+        -Body ([ordered]@{
+            location   = $Location
+            kind       = 'web'
+            properties = [ordered]@{
+                Application_Type    = 'web'
+                Request_Source      = 'SreAgent'
+                WorkspaceResourceId = $law.id
+            }
+        })
+
+    # Read it back: AppId and ConnectionString are assigned by the service.
+    $appInsights = Invoke-Az @(
+        'resource', 'show', '-g', $LabCreatorResourceGroup, '-n', $aiName,
+        '--resource-type', 'Microsoft.Insights/components', '--api-version', '2020-02-02', '-o', 'json'
+    )
+    $aiAppId = $appInsights.properties.AppId
+    $aiConnectionString = $appInsights.properties.ConnectionString
+    if ([string]::IsNullOrWhiteSpace($aiAppId) -or [string]::IsNullOrWhiteSpace($aiConnectionString)) {
+        throw "Application Insights $aiName has no AppId/ConnectionString yet. Re-run this script."
+    }
+    Write-Ok "Application Insights $aiName ready."
+
+    # Managed identity the agent acts as.
+    $identityName = "$LabCreatorAgentName-id-$suffix"
+    Write-Note "Creating managed identity $identityName..."
+    $identity = Invoke-Az @(
+        'identity', 'create', '-g', $LabCreatorResourceGroup, '-n', $identityName, '-l', $Location, '-o', 'json'
+    )
+    if (-not $identity.principalId) { throw "Could not create managed identity $identityName." }
+    Write-Ok "Identity $identityName ready."
+
+    # Monitoring Reader for the identity on the lab-creator group, so the agent can read
+    # its own telemetry. Access on the lab group is granted in Step 5.
+    $creatorScope = "/subscriptions/$subId/resourceGroups/$LabCreatorResourceGroup"
+    $existingMonReader = Invoke-Az @(
+        'role', 'assignment', 'list', '--assignee', $identity.principalId,
+        '--scope', $creatorScope, '--query', "[?roleDefinitionName=='Monitoring Reader']", '-o', 'json'
+    ) -AllowEmpty
+    if (-not ($existingMonReader -and @($existingMonReader).Count -gt 0)) {
+        $null = Invoke-Az @(
+            'role', 'assignment', 'create',
+            '--assignee-object-id', $identity.principalId,
+            '--assignee-principal-type', 'ServicePrincipal',
+            '--role', 'Monitoring Reader',
+            '--scope', $creatorScope, '-o', 'json'
+        ) -AllowEmpty
+    }
+
+    # The agent itself.
+    #   accessLevel High  - it needs to create resources to deploy the lab
+    #   actionMode Review - you approve every write it proposes
+    $agentBody = [ordered]@{
+        location   = $Location
+        tags       = @{ workload = 'onboardinglab-labcreator' }
+        identity   = [ordered]@{
+            type                   = 'SystemAssigned, UserAssigned'
+            userAssignedIdentities = @{ "$($identity.id)" = @{} }
+        }
+        properties = [ordered]@{
+            knowledgeGraphConfiguration = [ordered]@{
+                identity         = $identity.id
+                managedResources = @(
+                    "/subscriptions/$subId/resourceGroups/$LabCreatorResourceGroup"
+                    "/subscriptions/$subId/resourceGroups/$LabResourceGroup"
+                )
+            }
+            actionConfiguration         = [ordered]@{
+                accessLevel = 'High'
+                identity    = $identity.id
+                mode        = 'Review'
+            }
+            logConfiguration            = [ordered]@{
+                applicationInsightsConfiguration = [ordered]@{
+                    appId            = $aiAppId
+                    connectionString = $aiConnectionString
+                }
+            }
+            upgradeChannel              = 'Preview'
+            monthlyAgentUnitLimit       = 10000
+            defaultModel                = [ordered]@{
+                provider = 'MicrosoftFoundry'
+                name     = 'Automatic'
+            }
+            experimentalSettings        = [ordered]@{
+                EnableWorkspaceTools = $true
+                EnableHttpTriggers   = $true
+                EnableV2AgentLoop    = $true
+            }
         }
     }
 
-    $paramsFile = Join-Path ([System.IO.Path]::GetTempPath()) 'labcreator.parameters.json'
-    $paramsObject | ConvertTo-Json -Depth 10 | Set-Content -Path $paramsFile -NoNewline
+    Write-Note "Creating agent $LabCreatorAgentName (this takes a few minutes)..."
+    $null = Invoke-ArmRequest -Method 'put' `
+        -Url "$rgBase/Microsoft.App/agents/$LabCreatorAgentName`?api-version=$AgentApiVersion" `
+        -Body $agentBody
 
-    Write-Note "Deploying $LabCreatorAgentName (this takes a few minutes)..."
-    try {
-        $deployment = Invoke-Az @(
-            'deployment', 'group', 'create',
-            '--subscription', $subId,
-            '-g', $LabCreatorResourceGroup,
-            '--name', 'labcreator-agent',
-            '--template-file', $agentCoreBicep,
-            '--parameters', "@$paramsFile",
-            '-o', 'json'
-        )
-    }
-    finally {
-        Remove-Item -Path $paramsFile -ErrorAction SilentlyContinue
-    }
-
-    if ($deployment.properties.provisioningState -ne 'Succeeded') {
-        throw "Agent deployment finished with state $($deployment.properties.provisioningState)."
-    }
+    $agent = Wait-ForAgent -ResourceGroup $LabCreatorResourceGroup -Name $LabCreatorAgentName
     Write-Ok "Agent $LabCreatorAgentName created."
 }
 
 # Always read the agent back: the data-plane hostname contains service-assigned segments and
 # cannot be composed from the agent name and region.
-$agent = Invoke-Az @(
-    'resource', 'show', '-g', $LabCreatorResourceGroup, '-n', $LabCreatorAgentName,
-    '--resource-type', 'Microsoft.App/agents', '--api-version', '2025-05-01-preview', '-o', 'json'
-)
+$agent = Get-AgentResource -ResourceGroup $LabCreatorResourceGroup -Name $LabCreatorAgentName
+if (-not $agent) { throw "Agent $LabCreatorAgentName could not be read back." }
 
 $agentEndpoint = $agent.properties.agentEndpoint
 if ([string]::IsNullOrWhiteSpace($agentEndpoint)) {
@@ -367,61 +514,53 @@ Write-Step 'Step 4 - Allow the egress hosts the agent needs'
 # and replacing them would leave the agent unable to reach Azure at all.
 $egress = $agent.properties.sandboxConfiguration.egress
 
-$currentHosts = @()
-if ($egress -and $egress.allowedHosts) { $currentHosts = @($egress.allowedHosts) }
-
-$missing = @($RequiredEgressHosts | Where-Object { $_ -notin $currentHosts })
-
-if ($missing.Count -eq 0) {
-    Write-Ok 'All required hosts are already allowed.'
+if (-not $egress -or $egress.mode -eq 'Unrestricted') {
+    # No restriction in force, so the hosts are already reachable. Writing an allowlist
+    # here would *introduce* a restriction rather than relax one.
+    Write-Ok 'Sandbox egress is unrestricted; no allowlist needed.'
 }
 else {
-    Write-Note "Adding: $($missing -join ', ')"
+    $currentHosts = @()
+    if ($egress.allowedHosts) { $currentHosts = @($egress.allowedHosts) }
 
-    $mode = if ($egress -and $egress.mode) { $egress.mode } else { 'Limited' }
-    $egressBody = [ordered]@{
-        mode         = $mode
-        allowedHosts = @($currentHosts + $missing)
+    $missing = @($RequiredEgressHosts | Where-Object { $_ -notin $currentHosts })
+
+    if ($missing.Count -eq 0) {
+        Write-Ok 'All required hosts are already allowed.'
     }
-    # Preserve the other egress settings verbatim.
-    if ($egress) {
+    else {
+        Write-Note "Adding: $($missing -join ', ')"
+
+        $egressBody = [ordered]@{
+            mode         = $egress.mode
+            allowedHosts = @($currentHosts + $missing)
+        }
+        # Preserve the other egress settings verbatim.
         if ($null -ne $egress.allowedRegistries) { $egressBody['allowedRegistries'] = @($egress.allowedRegistries) }
         if ($null -ne $egress.allowedCodeRepositories) { $egressBody['allowedCodeRepositories'] = @($egress.allowedCodeRepositories) }
         if ($null -ne $egress.allowHttpMcpServerNetworkAccess) { $egressBody['allowHttpMcpServerNetworkAccess'] = $egress.allowHttpMcpServerNetworkAccess }
-    }
 
-    $patch = @{ properties = @{ sandboxConfiguration = @{ egress = $egressBody } } }
-    $patchFile = Join-Path ([System.IO.Path]::GetTempPath()) 'labcreator-egress.json'
-    $patch | ConvertTo-Json -Depth 10 | Set-Content -Path $patchFile -NoNewline
+        $armUrl = "https://management.azure.com/subscriptions/$subId/resourceGroups/$LabCreatorResourceGroup/providers/Microsoft.App/agents/$LabCreatorAgentName" + "?api-version=$AgentApiVersion"
+        $null = Invoke-ArmRequest -Method 'patch' -Url $armUrl `
+            -Body @{ properties = @{ sandboxConfiguration = @{ egress = $egressBody } } }
 
-    $armUrl = "https://management.azure.com/subscriptions/$subId/resourceGroups/$LabCreatorResourceGroup/providers/Microsoft.App/agents/$LabCreatorAgentName" + '?api-version=2025-05-01-preview'
-    try {
-        $null = Invoke-Az @(
-            'rest', '--method', 'patch', '--url', $armUrl,
-            '--headers', 'Content-Type=application/json',
-            '--body', "@$patchFile"
-        ) -AllowEmpty
-    }
-    finally {
-        Remove-Item -Path $patchFile -ErrorAction SilentlyContinue
-    }
+        # The PATCH briefly moves the agent to InProgress; wait for it to settle.
+        $deadline = (Get-Date).AddMinutes(5)
+        do {
+            Start-Sleep -Seconds 10
+            $check = Invoke-Az @(
+                'resource', 'show', '-g', $LabCreatorResourceGroup, '-n', $LabCreatorAgentName,
+                '--resource-type', 'Microsoft.App/agents', '--api-version', $AgentApiVersion,
+                '--query', '{state:properties.provisioningState,hosts:properties.sandboxConfiguration.egress.allowedHosts}', '-o', 'json'
+            )
+        } while ($check.state -eq 'InProgress' -and (Get-Date) -lt $deadline)
 
-    # The PATCH briefly moves the agent to InProgress; wait for it to settle.
-    $deadline = (Get-Date).AddMinutes(5)
-    do {
-        Start-Sleep -Seconds 10
-        $check = Invoke-Az @(
-            'resource', 'show', '-g', $LabCreatorResourceGroup, '-n', $LabCreatorAgentName,
-            '--resource-type', 'Microsoft.App/agents', '--api-version', '2025-05-01-preview',
-            '--query', '{state:properties.provisioningState,hosts:properties.sandboxConfiguration.egress.allowedHosts}', '-o', 'json'
-        )
-    } while ($check.state -eq 'InProgress' -and (Get-Date) -lt $deadline)
-
-    $stillMissing = @($RequiredEgressHosts | Where-Object { $_ -notin @($check.hosts) })
-    if ($stillMissing.Count -gt 0) {
-        throw "Egress update did not take effect. Still missing: $($stillMissing -join ', ')"
+        $stillMissing = @($RequiredEgressHosts | Where-Object { $_ -notin @($check.hosts) })
+        if ($stillMissing.Count -gt 0) {
+            throw "Egress update did not take effect. Still missing: $($stillMissing -join ', ')"
+        }
+        Write-Ok 'Egress hosts allowed.'
     }
-    Write-Ok 'Egress hosts allowed.'
 }
 
 # ── Step 5: grant Owner on the lab resource group ───────────────────────────
@@ -466,8 +605,8 @@ else {
     $portalUrl = "https://sre.azure.com/#/agent/$subId/$LabCreatorResourceGroup/$LabCreatorAgentName"
 
     Write-Host ''
-    Write-Host '   The agent needs read access to your fork of the sre-agent repository so it can' -ForegroundColor Yellow
-    Write-Host "   read $RunbookPath and the lab templates." -ForegroundColor Yellow
+    Write-Host '   The agent clones your fork of the sre-agent repository and deploys the lab' -ForegroundColor Yellow
+    Write-Host "   from it, so it needs read access to $RunbookPath and the lab templates." -ForegroundColor Yellow
     Write-Host ''
     Write-Host '   1. Open the agent in the portal:'
     Write-Host "      $portalUrl"
@@ -521,8 +660,9 @@ elseif ($agentAlreadyExisted -and -not $NewThread) {
 $startMessage = @"
 Deploy the Azure SRE Agent Onboarding Lab.
 
-Follow the runbook at $RunbookPath in the connected sre-agent repository. Work through every
-step in order and run its verification before moving on.
+The sre-agent repository you connected through Code Access is already synced into your
+workspace. Follow the runbook at $RunbookPath. Work through every step in order and run its
+verification before moving on.
 
 Inputs:
 - SUBSCRIPTION: $subId
@@ -580,4 +720,5 @@ Write-Host '  Watch progress at:'
 Write-Host "  https://sre.azure.com/#/agent/$subId/$LabCreatorResourceGroup/$LabCreatorAgentName"
 Write-Host ''
 Write-Host '  The agent runs in Review mode, so approve each action as it is proposed.' -ForegroundColor Yellow
+Write-Host '  Read commands run without prompting; only writes need your approval.' -ForegroundColor DarkGray
 Write-Host ''
