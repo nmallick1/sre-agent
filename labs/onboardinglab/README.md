@@ -255,18 +255,38 @@ action as it is proposed.
 
 You need:
 
-- A fork of this repository.
 - Owner on the subscription (the script registers a resource provider and creates role
   assignments).
 - Azure Cloud Shell (PowerShell). Nothing else is installed locally.
+- A fork of this repository, created below.
 
-From Cloud Shell:
+#### Fork this repository
+
+In step 6 you connect a repository to the lab creator agent so it can read
+[agent-deploy-runbook.md](agent-deploy-runbook.md) and the Bicep templates. Connect a fork
+you own rather than `microsoft/sre-agent` directly. Code Access grants the agent the
+repositories your GitHub account can reach, and many organisations restrict connecting
+repositories outside the org. A fork also pins the lab at a revision you control, so an
+upstream change cannot move the runbook under you part way through.
+
+Fork from the GitHub UI at [microsoft/sre-agent](https://github.com/microsoft/sre-agent)
+using **Fork**, or from Cloud Shell if the GitHub CLI is signed in:
 
 ```powershell
-git clone https://github.com/YOUR-ORG/sre-agent.git
+gh repo fork microsoft/sre-agent --clone=false
+```
+
+Then clone your fork and run the bootstrap:
+
+```powershell
+git clone https://github.com/<your-github-account>/sre-agent.git
 Set-Location ./sre-agent/labs/onboardinglab
 ./scripts/bootstrap-labcreator.ps1
 ```
+
+This fork is separate from the GitHub repository used in
+[manual setup](#manual-setup), where the lab agent files issues and any repository you can
+already create issues in is fine.
 
 The script:
 
