@@ -30,9 +30,6 @@ param agentName string
 @description('Required. Resource group that holds the agent + its identity + LAW + App Insights. Separate from the RGs the agent monitors.')
 param agentResourceGroupName string
 
-@description('Optional. Set true when the resource group already exists. Creating a resource group that exists in a different region fails, so use this when the group was pre-created or the deployer lacks subscription-level resource group create rights.')
-param useExistingResourceGroup bool = false
-
 @description('Required. Region available to the target subscription for Azure SRE Agent. See https://learn.microsoft.com/azure/sre-agent/supported-regions')
 param location string = 'eastus2'
 
@@ -178,17 +175,15 @@ param pluginConfigs array = []
 var subscriptionId = subscription().subscriptionId
 var suffix = uniqueString(subscriptionId, agentResourceGroupName, agentName)
 
-// Create the agent RG unless the caller says it already exists. A plain create is NOT
-// a safe no-op: if the group exists in a different region, ARM rejects the location change.
-resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = if (!useExistingResourceGroup) {
+// Create the agent RG if it doesn't already exist (idempotent — ARM no-op if present).
+resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
   name: agentResourceGroupName
   location: location
 }
 
 module core './agent-core.bicep' = {
   name: 'core-${uniqueString(deployment().name)}'
-  scope: resourceGroup(agentResourceGroupName)
-  dependsOn: [ rg ]
+  scope: rg
   params: {
     agentName: agentName
     location: location
@@ -217,7 +212,7 @@ module core './agent-core.bicep' = {
 
 module extensions './agent-extensions.bicep' = {
   name: 'ext-${uniqueString(deployment().name)}'
-  scope: resourceGroup(agentResourceGroupName)
+  scope: rg
   params: {
     agentName: agentName
     subagents: subagents
@@ -249,7 +244,7 @@ module extensions './agent-extensions.bicep' = {
 // Managed Identity to acquire the token transparently.
 module webhookBridge './logic-app-bridge.bicep' = if (enableWebhookBridge && !empty(webhookBridgeTriggerUrl)) {
   name: 'bridge-${uniqueString(deployment().name)}'
-  scope: resourceGroup(agentResourceGroupName)
+  scope: rg
   params: {
     agentName: agentName
     location: location

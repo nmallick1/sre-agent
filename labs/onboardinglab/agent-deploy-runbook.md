@@ -178,43 +178,40 @@ pwsh -NoProfile -Command "./Assemble-Agent.ps1 -ConfigDir /tmp/onboardinglab-age
 **Verify:** `/tmp/onboardinglab-agent.extras.json` exists and reports 3 skills, 1 hook,
 1 common-prompt, 1 incident-platform and 2 knowledge files.
 
-You only need `extras.json` from here on. The generated `parameters.json` targets the
-subscription-scoped `main.bicep`, which you are deliberately not using.
+You only need `extras.json` from here on. The generated `parameters.json` targets the shared
+subscription-scoped `main.bicep`. The lab deploys its own agent template instead, so that file
+is not used.
 
 ---
 
 ## Step 5 — Create the agent
 
-`agent-core.bicep` and `agent-extensions.bicep` are resource-group-scoped, so deploy them
-directly. This needs only Owner on `LAB_RG`.
+The lab owns its agent template at `labs/onboardinglab/infra/modules/sre-agent.bicep`, following
+the same pattern as the other labs in this repo. It is resource-group scoped and creates the
+managed identity, the RBAC, the agent and the Application Insights connector in a single
+deployment. This needs only Owner on `LAB_RG`.
+
+Do **not** deploy `sreagent-templates/bicep/agent-core.bicep` here. Those templates are shared by
+every lab, and this lab has a requirement they do not carry: the deployer is a service principal
+(you), not a human. The lab template detects the deployer's principal type; the shared one assumes
+`User` and fails a managed-identity deployment with `UnmatchedPrincipalType`.
 
 ```bash
 az deployment group create \
-  --subscription <SUBSCRIPTION> -g <LAB_RG> --name onboardinglab-agent-core \
-  --template-file sreagent-templates/bicep/agent-core.bicep \
-  --parameters agentName=<AGENT_NAME> location=<LOCATION> suffix=<NAME_PREFIX> \
-               accessLevel=Low actionMode=Review subscriptionId=<SUBSCRIPTION> \
-               targetResourceGroups='["<LAB_RG>"]' \
+  --subscription <SUBSCRIPTION> -g <LAB_RG> --name onboardinglab-agent \
+  --template-file labs/onboardinglab/infra/modules/sre-agent.bicep \
+  --parameters agentName=<AGENT_NAME> location=<LOCATION> \
+               appInsightsId=<applicationInsightsId> \
+               accessLevel=Low actionMode=Review \
                defaultModelProvider=MicrosoftFoundry \
-  --query "{state:properties.provisioningState,agentId:properties.outputs.agentId.value,endpoint:properties.outputs.agentDataPlaneUrl.value}" -o json
+  --query "{state:properties.provisioningState,agentId:properties.outputs.agentId.value,endpoint:properties.outputs.agentEndpoint.value}" -o json
 ```
 
-This also grants the agent's managed identity Reader, Monitoring Reader and Log Analytics Reader
-on `LAB_RG`, and grants you SRE Agent Administrator on the new agent.
+This grants the agent's managed identity Reader, Monitoring Reader and Log Analytics Reader on
+`LAB_RG`, grants its system-assigned identity the read access the connector needs, and grants you
+SRE Agent Administrator on the new agent.
 
-Then wire the Application Insights connector:
-
-```bash
-az deployment group create \
-  --subscription <SUBSCRIPTION> -g <LAB_RG> --name onboardinglab-agent-ext \
-  --template-file sreagent-templates/bicep/agent-extensions.bicep \
-  --parameters agentName=<AGENT_NAME> enableAppInsightsConnector=true \
-               appInsightsResourceId=<applicationInsightsId> \
-               appInsightsAppId=<applicationInsightsAppId> \
-  --query "{state:properties.provisioningState}" -o json
-```
-
-**Verify both are `Succeeded`**, then read the agent back:
+**Verify it is `Succeeded`**, then read the agent back:
 
 ```bash
 az resource show --subscription <SUBSCRIPTION> -g <LAB_RG> -n <AGENT_NAME> \
@@ -227,15 +224,12 @@ resource.** It contains service-assigned segments, for example
 `onboardinglab-agent--ab12cd34.ef56gh78.swedencentral.azuresre.ai`, and cannot be composed from
 the agent name and region.
 
-> If `agent-core` fails with `UnmatchedPrincipalType`, you are on a build without the principal-type
-> fix. Re-run adding `deployerPrincipalType=ServicePrincipal`. Note the agent resource is created
-> *before* that role assignment, so a healthy agent may already exist — check before assuming a
-> clean slate. A failed core deployment also blocks `agent-extensions`, so the connector would be
-> missing.
+> The agent resource is created *before* the role assignments, so a failed deployment can still
+> leave a healthy agent behind. Check what exists before assuming a clean slate and redeploying.
 
 > `az resource list --resource-type Microsoft.App/agents/connectors` returns `[]` even when the
-> connector exists; nested types do not enumerate that way. Verify via the `ext` deployment
-> operations instead.
+> connector exists; nested types do not enumerate that way. Verify via the deployment operations
+> instead: `az deployment operation group list -g <LAB_RG> --name onboardinglab-agent`.
 
 ---
 
