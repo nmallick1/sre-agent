@@ -27,6 +27,10 @@ param existingAgentAppInsightsId string = ''
 @description('Optional. Skip all role assignments. Set to true when RBAC is pre-configured or on redeploy to avoid RoleAssignmentExists errors.')
 param skipRoleAssignments bool = false
 
+@description('Optional. Principal type of the deploying identity, used for the SRE Agent Administrator role assignment. Leave empty to auto-detect (a service principal has no userPrincipalName). Set explicitly to Group, or to override detection.')
+@allowed(['', 'User', 'ServicePrincipal', 'Group'])
+param deployerPrincipalType string = ''
+
 @description('Optional. Full ARM resource ID of a delegated subnet (Microsoft.App/environments) for VNet integration. Leave empty for no VNet.')
 param vnetSubnetId string = ''
 
@@ -191,13 +195,20 @@ module targetRbacSystemMi 'role-assignments-target.bicep' = [for (rg, i) in targ
 
 // ── SRE Agent Administrator for deployer ──
 
+// `deployer().userPrincipalName` is empty for a service principal (managed identity,
+// CI/CD credential). Hardcoding 'User' makes every non-human deployment fail with
+// UnmatchedPrincipalType, which also blocks the dependent extensions module, so
+// connectors are silently never created.
+var detectedDeployerPrincipalType = empty(deployer().userPrincipalName) ? 'ServicePrincipal' : 'User'
+var effectiveDeployerPrincipalType = empty(deployerPrincipalType) ? detectedDeployerPrincipalType : deployerPrincipalType
+
 resource adminRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!skipRoleAssignments) {
   name: guid(sreAgent.id, deployer().objectId, 'e79298df-d852-4c6d-84f9-5d13249d1e55')
   scope: sreAgent
   properties: {
     roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', 'e79298df-d852-4c6d-84f9-5d13249d1e55')
     principalId: deployer().objectId
-    principalType: 'User'
+    principalType: effectiveDeployerPrincipalType
   }
 }
 
@@ -216,6 +227,9 @@ resource uamiAdminRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if
 // ── Outputs ──
 
 output agentId string = sreAgent.id
-output agentDataPlaneUrl string = 'https://${agentName}.${location}.azuresre.ai'
+// Read the real endpoint off the resource. The hostname contains service-assigned
+// segments (e.g. agent--ab12cd34.ef56gh78.<region>.azuresre.ai), so it cannot be
+// composed from the agent name and region.
+output agentDataPlaneUrl string = sreAgent.properties.agentEndpoint
 output managedIdentityId string = effectiveIdentityId
 output lawId string = law.id
