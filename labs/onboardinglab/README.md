@@ -280,21 +280,33 @@ gh repo fork microsoft/sre-agent --clone=false
 
 **You do not clone the fork yourself.** The agent does that. You only need one file.
 
-#### Run the bootstrap
+#### Download the bootstrap script
 
-Open [Azure Cloud Shell](https://shell.azure.com) in PowerShell mode, download the script
-from your fork and run it:
+Download the script from your fork in a browser, then upload it to Cloud Shell. Do not fetch
+it from inside Cloud Shell.
+
+1. On github.com, open your fork and navigate to
+   `labs/onboardinglab/scripts/bootstrap-labcreator.ps1`.
+2. Choose **Raw**, then save the file (right-click the Raw view and pick **Save link as**,
+   or press Ctrl+S).
+3. Check the saved name is exactly `bootstrap-labcreator.ps1`. Some browsers append `.txt`.
+
+Take it from your fork rather than from `microsoft/sre-agent`, so the script matches the
+runbook revision the agent will follow.
+
+#### Upload it to Cloud Shell and run it
+
+1. Open [Azure Cloud Shell](https://shell.azure.com) and switch it to **PowerShell**.
+2. On the Cloud Shell toolbar choose **Manage files**, then **Upload**, and pick the file you
+   just saved. It lands in your home directory.
+3. Run it:
 
 ```powershell
-$fork = '<your-github-account>'
-Invoke-WebRequest -OutFile bootstrap-labcreator.ps1 `
-  "https://raw.githubusercontent.com/$fork/sre-agent/main/labs/onboardinglab/scripts/bootstrap-labcreator.ps1"
 ./bootstrap-labcreator.ps1
 ```
 
 The script is self-contained: it uses only the Azure CLI, needs no repository clone and
-compiles no Bicep. Downloading it from your fork keeps it in step with the runbook the agent
-will follow.
+compiles no Bicep.
 
 This fork is separate from the GitHub repository used in
 [manual setup](#manual-setup), where the lab agent files issues and any repository you can
