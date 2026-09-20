@@ -21,10 +21,25 @@
       6. Pause while you connect your fork as a code repository.
       7. Start a thread asking the agent to deploy the lab.
 
-    The script is re-entrant. Most steps check Azure itself and skip work that
-    already exists, so a dropped Cloud Shell session is safe: run it again. If the
-    browser closes or the session times out you can simply run it again and it
-    resumes from the first incomplete step. Use -Reset to start over.
+    The script is re-entrant, because a portal session can die at any point. Run it
+    again and it picks up where it stopped. Use -Reset to start over.
+
+    Re-entrancy is mostly not based on the state file: each step asks Azure what
+    already exists and skips accordingly, so it behaves correctly even if the state
+    file is gone. That matters in Cloud Shell, which only persists $HOME when a
+    storage account is mounted.
+
+      Step 1  provider show before register
+      Step 2  group show before group create
+      Step 3  Log Analytics / App Insights / agent are PUT upserts and az identity
+              create is idempotent; the agent is read first, and if it is still
+              provisioning the script waits instead of PUTting over it
+      Step 4  reads the current allowlist and appends only what is missing
+      Step 5  role assignment list before role assignment create
+      Step 6  state file only (re-prompting just costs you an extra Enter)
+      Step 7  the one step that must not repeat: every POST starts another thread,
+              and two threads means two agents deploying the same lab at once, so
+              it is skipped when a thread is recorded and asks when it is not
 
 .PARAMETER Subscription
     Subscription to deploy into. Defaults to the current az subscription.
@@ -340,13 +355,25 @@ foreach ($rg in @($LabCreatorResourceGroup, $LabResourceGroup)) {
 Write-Step 'Step 3 - Create the lab-creator agent'
 
 $agent = Get-AgentResource -ResourceGroup $LabCreatorResourceGroup -Name $LabCreatorAgentName
+$agentState = if ($agent) { $agent.properties.provisioningState } else { $null }
 
-if ($agent -and $agent.properties.provisioningState -eq 'Succeeded') {
+if ($agentState -eq 'Succeeded') {
     # Tracked so Step 7 can distinguish "first run" from "state file was lost".
     $agentAlreadyExisted = $true
     Write-Ok "Agent $LabCreatorAgentName already exists."
 }
+elseif ($agent -and $agentState -notin @('Failed', 'Canceled')) {
+    # A previous run created it and the session died while it was still provisioning.
+    # Wait for it rather than PUTting over a resource that is mid-creation.
+    $agentAlreadyExisted = $true
+    Write-Note "Agent $LabCreatorAgentName is still provisioning ($agentState). Waiting..."
+    $agent = Wait-ForAgent -ResourceGroup $LabCreatorResourceGroup -Name $LabCreatorAgentName
+    Write-Ok "Agent $LabCreatorAgentName is ready."
+}
 else {
+    if ($agentState -in @('Failed', 'Canceled')) {
+        Write-Note "Agent $LabCreatorAgentName is in state $agentState. Recreating it."
+    }
     $agentAlreadyExisted = $false
 
     # Deterministic suffix so re-runs address the same Log Analytics / App Insights resources.
