@@ -49,9 +49,16 @@ param(
 
     [string] $LabCreatorAgentName = 'labcreator-sreagent',
 
+    # Progress is recorded here so the script can resume after a dropped session.
+    # In Azure Cloud Shell this persists only when a storage account is mounted; an
+    # ephemeral session loses it. Losing it is safe: every step re-checks Azure itself
+    # rather than trusting this file, and the thread start asks before running twice.
     [string] $StateFile = (Join-Path $HOME '.onboardinglab-bootstrap.json'),
 
-    [switch] $Reset
+    [switch] $Reset,
+
+    # Start another deployment thread even if one was started already.
+    [switch] $NewThread
 )
 
 $ErrorActionPreference = 'Stop'
@@ -267,9 +274,12 @@ try {
 catch { $agentExists = $null }
 
 if ($agentExists -and $agentExists.properties.provisioningState -eq 'Succeeded') {
+    # Tracked so Step 7 can distinguish "first run" from "state file was lost".
+    $agentAlreadyExisted = $true
     Write-Ok "Agent $LabCreatorAgentName already exists."
 }
 else {
+    $agentAlreadyExisted = $false
     # Deterministic suffix so re-runs address the same Log Analytics / App Insights resources.
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -479,11 +489,34 @@ else {
 
 Write-Step 'Step 7 - Ask the agent to deploy the lab'
 
-$dpToken = (& az account get-access-token --resource 'https://azuresre.dev' --query accessToken -o tsv 2>$null)
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($dpToken -join ''))) {
-    throw 'Could not get a data-plane token for https://azuresre.dev. Run: az login --scope "https://azuresre.dev/.default" and re-run this script.'
+# This is the one step that is not safe to simply repeat: every POST starts another
+# thread, and two threads would have two agents deploying the same lab into the same
+# resource group at once, each asking for conflicting approvals.
+$existingThreadId = if ($state.Contains('threadId')) { $state['threadId'] } else { $null }
+$threadId = $existingThreadId
+$startThread = $true
+
+if ($existingThreadId -and -not $NewThread) {
+    Write-Ok "A deployment thread was already started: $existingThreadId"
+    Write-Note 'Re-running does not start another one. Use -NewThread to force a fresh thread.'
+    $startThread = $false
 }
-$dpToken = ($dpToken -join '').Trim()
+elseif ($agentAlreadyExisted -and -not $NewThread) {
+    # The agent predates this run but nothing recorded a thread, which usually means the
+    # state file was lost with an ephemeral Cloud Shell session. A thread may already be
+    # running, so confirm rather than silently starting a second one.
+    Write-Host ''
+    Write-Warning 'The agent already existed, but this run has no record of a deployment thread.'
+    Write-Host '   The state file was probably lost with a previous session.' -ForegroundColor DarkGray
+    Write-Host '   Check whether a deployment is already running before starting another:' -ForegroundColor DarkGray
+    Write-Host "   https://sre.azure.com/#/agent/$subId/$LabCreatorResourceGroup/$LabCreatorAgentName"
+    Write-Host ''
+    $reply = Read-Host '   Start a new deployment thread? [y/N]'
+    if ($reply -notmatch '^\s*[Yy]') {
+        Write-Note 'Skipped. Re-run with -NewThread once you are sure no thread is running.'
+        $startThread = $false
+    }
+}
 
 $startMessage = @"
 Deploy the Azure SRE Agent Onboarding Lab.
@@ -502,25 +535,36 @@ The resource group already exists and you have Owner on it. Leave the database f
 Do not modify anything outside $LabResourceGroup. Report what you created when you are done.
 "@
 
-$body = @{ StartMessage = $startMessage } | ConvertTo-Json -Depth 5
+if ($startThread) {
+    $dpToken = (& az account get-access-token --resource 'https://azuresre.dev' --query accessToken -o tsv 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($dpToken -join ''))) {
+        throw 'Could not get a data-plane token for https://azuresre.dev. Run: az login --scope "https://azuresre.dev/.default" and re-run this script.'
+    }
+    $dpToken = ($dpToken -join '').Trim()
 
-try {
-    $thread = Invoke-RestMethod -Uri "$agentEndpoint/api/v1/threads" -Method Post `
-        -Headers @{ Authorization = "Bearer $dpToken" } `
-        -ContentType 'application/json' -Body $body -TimeoutSec 60
-}
-catch {
-    throw "Could not start the agent thread: $($_.Exception.Message)"
-}
-finally {
-    $dpToken = $null
-}
+    $body = @{ StartMessage = $startMessage } | ConvertTo-Json -Depth 5
 
-$threadId = if ($thread.id) { $thread.id } elseif ($thread.threadId) { $thread.threadId } else { $null }
-$state['threadId'] = $threadId
-Save-State -State $state
+    try {
+        $thread = Invoke-RestMethod -Uri "$agentEndpoint/api/v1/threads" -Method Post `
+            -Headers @{ Authorization = "Bearer $dpToken" } `
+            -ContentType 'application/json' -Body $body -TimeoutSec 60
+    }
+    catch {
+        throw "Could not start the agent thread: $($_.Exception.Message)"
+    }
+    finally {
+        $dpToken = $null
+    }
 
-Write-Ok 'Thread started.'
+    $threadId = if ($thread.id) { $thread.id } elseif ($thread.threadId) { $thread.threadId } else { $null }
+
+    # Recorded immediately so a session that dies right after this does not start a second
+    # thread on the next run.
+    $state['threadId'] = $threadId
+    Save-State -State $state
+
+    Write-Ok 'Thread started.'
+}
 
 # ── Done ────────────────────────────────────────────────────────────────────
 

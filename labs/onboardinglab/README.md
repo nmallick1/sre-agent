@@ -301,9 +301,17 @@ The script:
    OAuth consent and cannot be scripted.
 7. Starts an agent thread pointing at the runbook.
 
-The script is **re-entrant**. Progress is saved to `~/.onboardinglab-bootstrap.json`, so if
-Cloud Shell times out or the browser closes, run it again and it resumes at the first
-incomplete step. Use `-Reset` to start over.
+The script is **re-entrant**. Run it again after any interruption and it resumes at the
+first incomplete step. Use `-Reset` to start over.
+
+Most steps do not rely on saved progress at all: they check Azure itself and skip work
+that already exists, so they behave correctly even on a completely fresh session. Progress
+is also written to `~/.onboardinglab-bootstrap.json`. In Cloud Shell that file persists
+only when a storage account is mounted, so an **ephemeral session loses it** — which is
+safe, because the only step that cannot simply be repeated is the last one. Starting a
+second deployment thread would put two agents in the same resource group at once, so the
+script skips that step when a thread is already recorded, and asks first if the record was
+lost. Use `-NewThread` to start another one deliberately.
 
 Choose a region that supports both Azure SRE Agent and this subscription's PostgreSQL
 16 / B1ms offering. The default is `swedencentral`. Some subscriptions are restricted from
