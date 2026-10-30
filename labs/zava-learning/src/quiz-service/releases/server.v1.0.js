@@ -65,6 +65,17 @@ pool.on("error", (err) => {
   console.error(`pool error: ${err.message}`);
 });
 
+// pool.on("error") only covers IDLE clients. A client that is checked out (or mid-handshake)
+// when the server drops the socket (e.g. ECONNRESET during a PostgreSQL restart) emits
+// 'error' on the Client itself; with no listener Node treats it as an unhandled 'error'
+// event and exits the process. Attach a per-client listener so a DB outage degrades /health
+// to 503 instead of crash-looping every replica.
+pool.on("connect", (client) => {
+  client.on("error", (err) => {
+    console.error(`pg client error: ${err.code || ""} ${err.message}`);
+  });
+});
+
 // Lightweight readiness ping. Surfaces secret/pool/connectivity faults as 503 so both the
 // AppGw probe and Azure Monitor see the lane as unhealthy.
 app.get("/health", async (_req, res) => {
